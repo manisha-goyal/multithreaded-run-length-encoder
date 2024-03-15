@@ -79,7 +79,8 @@ void encode(char* file, EncoderState *state) {
         }
     }
 
-    munmap(addr, sb.st_size);
+    if(munmap(addr, sb.st_size) == -1)
+        handleError("Error: unable to un-mmap file", 1);
     close(fd);
 }
 
@@ -89,3 +90,9 @@ void handleError(const char* message, int exitCode) {
         exit(exitCode);
     }
 }
+
+/*Reference:
+https://people.cs.rutgers.edu/~pxk/416/notes/c-tutorials/getopt.html
+https://eric-lo.gitbook.io/memory-mapped-io/shared-memory
+
+*/

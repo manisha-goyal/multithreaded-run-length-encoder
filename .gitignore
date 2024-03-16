@@ -4,3 +4,4 @@ nyuenc.o
 nyuenc
 .vscode/settings.json
 Input_Output
+.metals/metals.lock.db

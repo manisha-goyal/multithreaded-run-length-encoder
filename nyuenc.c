@@ -5,15 +5,15 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <string.h>
+#include <stdint.h>
 
 #define MAX_CHUNK_SIZE 4096
 
 typedef struct {
-    int input_order;
-    char* input_data;      
-    int input_size;     
-    char* encoded_data;   
-    int enc_size;
+    int pos;
+    char* data;      
+    int size;
 } Data;
 
 typedef struct Node {
@@ -41,7 +41,7 @@ Data* dequeue(Queue* queue);
 void* encode();
 void handle_error(const char* message, int exitCode);
 void create_thread_pool(int num_jobs);
-int create_task_queue(int arg_pos, int argc, char *argv[]);
+int create_task_queue(int arg_index, int arg_count, char** filenames);
 void process_completed_tasks(int task_count);
 
 void init_queue(Queue* queue) {
@@ -55,11 +55,11 @@ void enqueue(Queue* queue, Data* data) {
     newNode->data = data;
     newNode->next = NULL;
 
-    if (queue->head == NULL) {
+    if (queue->head == NULL)
         queue->head = newNode;
-    } else {
+    else
         queue->tail->next = newNode;
-    }
+
     queue->tail = newNode;
     queue->size++;
 }
@@ -69,9 +69,8 @@ Data* dequeue(Queue* queue) {
     Data* data = tempNode->data;
     queue->head = queue->head->next;
 
-    if (queue->head == NULL) {
+    if (queue->head == NULL)
         queue->tail = NULL;
-    }
 
     free(tempNode);
     queue->size--;
@@ -99,11 +98,21 @@ int main(int argc, char *argv[]) {
 
     init_queue(&tasks);
     init_queue(&completed_tasks);
-
     create_thread_pool(num_jobs);
     int task_count = create_task_queue(optind, argc, argv);
     process_completed_tasks(task_count);
+
     return 0;
+}
+
+void create_thread_pool(int num_jobs) {
+    pthread_t threads[num_jobs];
+
+    for (int i = 0; i < num_jobs; i++) {
+        int thread = pthread_create(&threads[i], NULL, encode, NULL);
+        if(thread)
+            handle_error("Error: unable to create threads", 1);
+    }
 }
 
 void* encode() {
@@ -111,12 +120,15 @@ void* encode() {
         pthread_mutex_lock(&tasks_mutex);
         while (tasks.size == 0)
             pthread_cond_wait(&tasks_cond, &tasks_mutex);
-        Data* data = dequeue(&tasks);
+        Data* input_data = dequeue(&tasks);
         pthread_mutex_unlock(&tasks_mutex);
         
-        char *read_ptr = data->input_data;
-        char *end_ptr = data->input_data + data->input_size;
-        char *write_ptr = data->encoded_data = malloc(data->input_size * 2);
+        Data* encoded_data = malloc(sizeof(Data));
+        encoded_data->pos = input_data->pos;
+        char *read_ptr = input_data->data;
+        char *end_ptr = input_data->data + input_data->size;
+        char *write_ptr = encoded_data->data = malloc(input_data->size * 2);
+        
         while (read_ptr < end_ptr) {
             char current_char = *read_ptr++;
             int count = 1;
@@ -127,29 +139,24 @@ void* encode() {
             *write_ptr++ = current_char;
             *write_ptr++ = (unsigned int)count;
         }
-        data->enc_size = write_ptr - data->encoded_data;
+        encoded_data->size = write_ptr - encoded_data->data;
         
+        munmap(input_data->data, (size_t)input_data->size);
+        free(input_data);
+
         pthread_mutex_lock(&completed_tasks_mutex);
-        enqueue(&completed_tasks, data);
+        enqueue(&completed_tasks, encoded_data);
         pthread_cond_signal(&completed_tasks_cond);
         pthread_mutex_unlock(&completed_tasks_mutex);
     }
 }
 
-void create_thread_pool(int num_jobs) {
-    pthread_t threads[num_jobs];
-    for (int i = 0; i < num_jobs; i++) {
-        int thread = pthread_create(&threads[i], NULL, encode, NULL);
-        if(thread)
-            handle_error("Error: unable to create threads", 1);
-    }
-}
-
-int create_task_queue(int arg_pos, int argc, char *argv[]) {
+int create_task_queue(int arg_index, int arg_count, char** filenames) {
     int input_order = 0;
     int task_count = 0;
-    while (arg_pos < argc) {
-        int fd = open(argv[arg_pos++], O_RDONLY);
+
+    while (arg_index < arg_count) {
+        int fd = open(filenames[arg_index++], O_RDONLY);
         if (fd == -1)
             handle_error("Error: unable to open file", 1);
 
@@ -159,24 +166,27 @@ int create_task_queue(int arg_pos, int argc, char *argv[]) {
             handle_error("Error: unable to get file size", 1);
         }
 
-        char* input_data = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (input_data == MAP_FAILED) {
+        char* file_data = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (file_data == MAP_FAILED) {
             close(fd);
             handle_error("Error: unable to mmap file", 1);
         }
 
-        int chunks = sb.st_size / MAX_CHUNK_SIZE + (sb.st_size % MAX_CHUNK_SIZE == 0 ? 0 : 1);
-        for (int i = 0; i < chunks; i++) {
-            Data* data = malloc(sizeof(Data));
-            data->input_order = input_order++;
-            data->input_data = input_data + (i * MAX_CHUNK_SIZE);
-            data->input_size = (i < chunks - 1) ? MAX_CHUNK_SIZE : (sb.st_size - (i * MAX_CHUNK_SIZE));
+        int chunk_count = sb.st_size / MAX_CHUNK_SIZE + (sb.st_size % MAX_CHUNK_SIZE == 0 ? 0 : 1);
+        for (int i = 0; i < chunk_count; i++) {
+            Data* input_data = malloc(sizeof(Data));
+            
+            input_data->pos = input_order++;
+            input_data->data = file_data + (i * MAX_CHUNK_SIZE);
+            input_data->size = (i < chunk_count - 1) ? MAX_CHUNK_SIZE : (sb.st_size - (i * MAX_CHUNK_SIZE));
+            
             pthread_mutex_lock(&tasks_mutex);
-            enqueue(&tasks, data);
+            enqueue(&tasks, input_data);
             pthread_cond_signal(&tasks_cond);
             pthread_mutex_unlock(&tasks_mutex);
         }
-        task_count += chunks;
+
+        task_count += chunk_count;
         close(fd);
     }
 
@@ -184,44 +194,51 @@ int create_task_queue(int arg_pos, int argc, char *argv[]) {
 }
 
 void process_completed_tasks(int task_count) {
-    Data* completed_tasks_ordered[task_count];
     char prev_last_char = 0;
     unsigned int prev_last_count = 0;
+    char* output_buffer = malloc(task_count * MAX_CHUNK_SIZE * sizeof(char));
+    int buffer_index = 0;
     int task_index = 0;
-
-    for(int i = 0; i < task_count; i++)
-        completed_tasks_ordered[i] = NULL;
+    Data* completed_tasks_ordered[task_count];
+    memset(completed_tasks_ordered, 0, sizeof(completed_tasks_ordered));
 
     while (task_index < task_count) {
-        if (completed_tasks_ordered[task_index] != NULL) {
-            Data *data = completed_tasks_ordered[task_index];
-            if (task_index > 0 && prev_last_char == data->encoded_data[0]) {
-                data->encoded_data[1] += prev_last_count;
-                write(STDOUT_FILENO, data->encoded_data, data->enc_size - 2);
-            }
-            else {
-                if (prev_last_count > 0) {
-                    write(STDOUT_FILENO, &prev_last_char, 1);
-                    write(STDOUT_FILENO, &prev_last_count, 1);
-                }
-                write(STDOUT_FILENO, data->encoded_data, data->enc_size - 2);
-            }
-            prev_last_char = data->encoded_data[data->enc_size - 2];
-            prev_last_count = data->encoded_data[data->enc_size - 1];
-            task_index++;
+        if (completed_tasks_ordered[task_index] == NULL) {
+            pthread_mutex_lock(&completed_tasks_mutex);
+            while (completed_tasks.size == 0)
+                pthread_cond_wait(&completed_tasks_cond, &completed_tasks_mutex);
+            Data* encoded_chunk = dequeue(&completed_tasks);
+            pthread_mutex_unlock(&completed_tasks_mutex);
+            
+            completed_tasks_ordered[encoded_chunk->pos] = encoded_chunk;
             continue;
         }
 
-        pthread_mutex_lock(&completed_tasks_mutex);
-        while (completed_tasks.size == 0)
-            pthread_cond_wait(&completed_tasks_cond, &completed_tasks_mutex);
-        Data *encoded_chunk = dequeue(&completed_tasks);
-        pthread_mutex_unlock(&completed_tasks_mutex);
-        completed_tasks_ordered[encoded_chunk->input_order] = encoded_chunk;
+        Data* encoded_data = completed_tasks_ordered[task_index];
+        if (task_index > 0) {
+            if (prev_last_char == encoded_data->data[0]) {
+                encoded_data->data[1] += prev_last_count;
+            } else {
+                output_buffer[buffer_index++] = prev_last_char;
+                output_buffer[buffer_index++] = prev_last_count;
+            }
+        }
+        memcpy(&output_buffer[buffer_index], encoded_data->data, encoded_data->size - 2);
+        buffer_index += encoded_data->size - 2;
+        
+        prev_last_char = encoded_data->data[encoded_data->size - 2];
+        prev_last_count = encoded_data->data[encoded_data->size - 1];
+        task_index++;
+        
+        free(encoded_data->data);
+        free(encoded_data);
     }
 
-    write(STDOUT_FILENO, &prev_last_char, 1);
-    write(STDOUT_FILENO, &prev_last_count, 1);
+    output_buffer[buffer_index++] = prev_last_char;
+    output_buffer[buffer_index++] = prev_last_count;
+    write(STDOUT_FILENO, output_buffer, buffer_index);
+
+    free(output_buffer);
 }
 
 void handle_error(const char* message, int exitCode) {
@@ -245,4 +262,6 @@ https://www.cs.cmu.edu/afs/cs/academic/class/15492-f07/www/pthreads.html#SCHEDUL
 https://code-vault.net/lesson/j62v2novkv:1609958966824
 https://alperenbayramoglu2.medium.com/thread-pools-in-a-nutshell-527414eef5f2
 https://stackoverflow.com/questions/10600250/is-it-necessary-to-call-pthread-join
+https://stackoverflow.com/questions/22465908/how-could-i-initialize-an-array-of-struct-to-null
+https://www.tutorialspoint.com/c_standard_library/c_function_memcpy.htm
 */

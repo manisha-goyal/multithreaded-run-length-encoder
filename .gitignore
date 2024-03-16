@@ -2,4 +2,5 @@ nyuenc-autograder
 .DS_Store
 nyuenc.o
 nyuenc
-file.txt
+.vscode/settings.json
+Input_Output

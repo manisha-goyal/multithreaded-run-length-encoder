@@ -226,4 +226,6 @@ https://www.educative.io/answers/how-to-create-a-simple-thread-in-c
 https://dev.to/quantumsheep/basics-of-multithreading-in-c-4pam
 https://www.cs.cmu.edu/afs/cs/academic/class/15492-f07/www/pthreads.html#SCHEDULING
 https://code-vault.net/lesson/j62v2novkv:1609958966824
+https://alperenbayramoglu2.medium.com/thread-pools-in-a-nutshell-527414eef5f2
+https://stackoverflow.com/questions/10600250/is-it-necessary-to-call-pthread-join
 */

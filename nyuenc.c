@@ -4,8 +4,12 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <pthread.h>
+
+#define MAX_CHUNK_SIZE 4096
 
 typedef struct {
+    int input_order;
     char* input_data;      
     int input_size;     
     char* encoded_data;   
@@ -23,10 +27,24 @@ typedef struct {
     int size;
 } Queue;
 
+typedef struct {
+    Data** data;
+    int size;
+    int capacity;
+} PriorityQueue;
+
+pthread_mutex_t tasks_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t completed_tasks_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t tasks_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t completed_tasks_cond = PTHREAD_COND_INITIALIZER;
+
+Queue tasks;
+PriorityQueue completed_tasks;
+
 void init_queue(Queue* queue);
 void enqueue(Queue* queue, Data* data);
 Data* dequeue(Queue* queue);
-void encode_data(Data *data);
+void* encode();
 void handleError(const char* message, int exitCode);
 
 void init_queue(Queue* queue) {
@@ -40,7 +58,7 @@ void enqueue(Queue* queue, Data* data) {
     newNode->data = data;
     newNode->next = NULL;
 
-    if (queue->head == NULL) {
+    if(queue->head == NULL) {
         queue->head = newNode;
     } else {
         queue->tail->next = newNode;
@@ -54,7 +72,7 @@ Data* dequeue(Queue* queue) {
     Data* data = tempNode->data;
     queue->head = queue->head->next;
 
-    if (queue->head == NULL) {
+    if(queue->head == NULL) {
         queue->tail = NULL;
     }
 
@@ -63,30 +81,81 @@ Data* dequeue(Queue* queue) {
     return data;
 }
 
-void encode_data(Data* data) {
-    data->encoded_data = malloc(data->input_size * 2);
-    int j = 0;
-    for (int i = 0; i < data->input_size;) {
-        int count = 1;
-        while ((i + count) < data->input_size && data->input_data[i] == data->input_data[i + count]) {
-            count++;
-        }
-        data->encoded_data[j++] = data->input_data[i];
-        data->encoded_data[j++] = (unsigned int)count;
-        i += count;
+void pq_init(PriorityQueue* pq, int initialCapacity) {
+    pq->data = malloc(initialCapacity * sizeof(Data*));
+    pq->size = 0;
+    pq->capacity = initialCapacity;
+}
+
+void pq_push(PriorityQueue* pq, Data* data) {
+    int i = pq->size++;
+    while(i > 0 && pq->data[(i - 1) / 2]->input_order > data->input_order) {
+        pq->data[i] = pq->data[(i - 1) / 2];
+        i = (i - 1) / 2;
     }
-    data->enc_size = j;
+    pq->data[i] = data;
+}
+
+Data* pq_pop(PriorityQueue* pq) {
+    if(pq->size == 0) return NULL;
+    
+    Data* data = pq->data[0];
+    pq->data[0] = pq->data[--pq->size];
+    
+    int i = 0;
+    while(i * 2 + 1 < pq->size) {
+        int left = i * 2 + 1, right = i * 2 + 2;
+        int j = left;
+        if(right < pq->size && pq->data[right]->input_order < pq->data[left]->input_order)
+            j = right;
+        if(pq->data[i]->input_order <= pq->data[j]->input_order) 
+            break;
+        Data* temp = pq->data[i];
+        pq->data[i] = pq->data[j];
+        pq->data[j] = temp;
+        i = j;
+    }
+    
+    return data;
+}
+
+void* encode() {
+    while(1) {
+        pthread_mutex_lock(&tasks_mutex);
+        while(tasks.size == 0)
+            pthread_cond_wait(&tasks_cond, &tasks_mutex);
+        Data* data = dequeue(&tasks);
+        pthread_mutex_unlock(&tasks_mutex);
+        
+        data->encoded_data = malloc(data->input_size * 2);
+        int j = 0;
+        for(int i = 0; i < data->input_size;) {
+            int count = 1;
+            while((i + count) < data->input_size && data->input_data[i] == data->input_data[i + count]) {
+                count++;
+            }
+            data->encoded_data[j++] = data->input_data[i];
+            data->encoded_data[j++] = (unsigned int)count;
+            i += count;
+        }
+        data->enc_size = j;
+        
+        pthread_mutex_lock(&completed_tasks_mutex);
+        pq_push(&completed_tasks, data);
+        pthread_cond_signal(&completed_tasks_cond);
+        pthread_mutex_unlock(&completed_tasks_mutex);
+    }
 }
 
 int main(int argc, char* argv[]) {
     int opt;
     int num_jobs = 1;
 
-    while ((opt = getopt(argc, argv, "j:")) != -1) {
-        switch (opt) {
+    while((opt = getopt(argc, argv, "j:")) != -1) {
+        switch(opt) {
             case 'j':
                 num_jobs = atoi(optarg);
-                if (num_jobs < 1)
+                if(num_jobs < 1)
                     handleError("Number of jobs must be at least 1", 1);
                 break;
             default:
@@ -94,53 +163,68 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (optind >= argc)
+    if(optind >= argc)
         handleError("Usage: ./nyuenc [-j njobs] <file1> [file2] ...\n", 1);
 
-    Queue tasks;
-    Queue completed_tasks;
     init_queue(&tasks);
-    init_queue(&completed_tasks);
+    
 
     int arg_pos = optind;
-    while (arg_pos < argc) {
+    int input_order = 0;
+    int tasks_count = 0;
+    while(arg_pos < argc) {
         int fd = open(argv[arg_pos++], O_RDONLY);
-        if (fd == -1)
+        if(fd == -1)
             handleError("Error: unable to open file", 1);
 
         struct stat sb;
-        if (fstat(fd, &sb) == -1) {
+        if(fstat(fd, &sb) == -1) {
             close(fd);
             handleError("Error: unable to get file size", 1);
         }
 
         char* input_data = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (input_data == MAP_FAILED) {
+        if(input_data == MAP_FAILED) {
             close(fd);
             handleError("Error: unable to mmap file", 1);
         }
 
-        int chunks = sb.st_size / 4096 + (sb.st_size % 4096 == 0 ? 0 : 1);
-        for (int i = 0; i < chunks; i++) {
+        int chunks = sb.st_size / MAX_CHUNK_SIZE + (sb.st_size % MAX_CHUNK_SIZE == 0 ? 0 : 1);
+        for(int i = 0; i < chunks; i++) {
             Data* data = malloc(sizeof(Data));
-            data->input_data = input_data + (i * 4096);
-            data->input_size = (i < chunks - 1) ? 4096 : (sb.st_size - (i * 4096));
+            data->input_order = input_order++;
+            data->input_data = input_data + (i * MAX_CHUNK_SIZE);
+            data->input_size = (i < chunks - 1) ? MAX_CHUNK_SIZE : (sb.st_size - (i * MAX_CHUNK_SIZE));
+            pthread_mutex_lock(&tasks_mutex);
             enqueue(&tasks, data);
+            pthread_cond_signal(&tasks_cond);
+            pthread_mutex_unlock(&tasks_mutex);
         }
+        tasks_count += chunks;
         close(fd);
     }
 
-    while (tasks.size > 0) {
-        Data* data = dequeue(&tasks);
-        encode_data(data);
-        enqueue(&completed_tasks, data);
+    pq_init(&completed_tasks, tasks_count);
+
+    pthread_t threads[num_jobs];
+    for(int i = 0; i < num_jobs; i++) {
+        pthread_create(&threads[i], NULL, encode, NULL);
     }
 
     char prev_last_char = 0;
     unsigned int prev_last_count = 0;
-    while (completed_tasks.size > 0) {
-        Data* data = dequeue(&completed_tasks);
-        if (prev_last_count > 0 && prev_last_char == data->encoded_data[0]) {
+    int task_index = 0;
+
+    while(task_index < tasks_count) {
+        pthread_mutex_lock(&completed_tasks_mutex);
+        
+        while(completed_tasks.size == 0)
+            pthread_cond_wait(&completed_tasks_cond, &completed_tasks_mutex);
+
+        Data* data = pq_pop(&completed_tasks);
+        pthread_mutex_unlock(&completed_tasks_mutex);
+
+        if(prev_last_count > 0 && prev_last_char == data->encoded_data[0]) {
             data->encoded_data[1] += prev_last_count;
             write(STDOUT_FILENO, data->encoded_data, data->enc_size - 2);
         } else {
@@ -152,6 +236,10 @@ int main(int argc, char* argv[]) {
         }
         prev_last_char = data->encoded_data[data->enc_size - 2];
         prev_last_count = data->encoded_data[data->enc_size - 1];
+        task_index++;
+
+        free(data->encoded_data);
+        free(data);
     }
 
     write(STDOUT_FILENO, &prev_last_char, 1);
@@ -162,7 +250,7 @@ int main(int argc, char* argv[]) {
 
 void handleError(const char* message, int exitCode) {
     fprintf(stderr, "%s\n", message);
-    if (exitCode != 0) {
+    if(exitCode != 0) {
         exit(exitCode);
     }
 }

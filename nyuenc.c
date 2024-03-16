@@ -114,18 +114,20 @@ void* encode() {
         Data* data = dequeue(&tasks);
         pthread_mutex_unlock(&tasks_mutex);
         
-        data->encoded_data = malloc(data->input_size * 2);
-        int j = 0;
-        for (int i = 0; i < data->input_size;) {
+        char *read_ptr = data->input_data;
+        char *end_ptr = data->input_data + data->input_size;
+        char *write_ptr = data->encoded_data = malloc(data->input_size * 2);
+        while (read_ptr < end_ptr) {
+            char current_char = *read_ptr++;
             int count = 1;
-            while ((i + count) < data->input_size && data->input_data[i] == data->input_data[i + count]) {
+            while (read_ptr < end_ptr && current_char == *read_ptr) {
+                read_ptr++;
                 count++;
             }
-            data->encoded_data[j++] = data->input_data[i];
-            data->encoded_data[j++] = (unsigned int)count;
-            i += count;
+            *write_ptr++ = current_char;
+            *write_ptr++ = (unsigned int)count;
         }
-        data->enc_size = j;
+        data->enc_size = write_ptr - data->encoded_data;
         
         pthread_mutex_lock(&completed_tasks_mutex);
         enqueue(&completed_tasks, data);

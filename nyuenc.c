@@ -95,7 +95,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (optind >= argc)
-        handleError("Expected argument after options\n", 1);
+        handleError("Usage: ./nyuenc [-j njobs] <file1> [file2] ...\n", 1);
 
     Queue tasks;
     Queue completed_tasks;
@@ -120,11 +120,11 @@ int main(int argc, char* argv[]) {
             handleError("Error: unable to mmap file", 1);
         }
 
-        int chunk_count = sb.st_size / 4096 + (sb.st_size % 4096 == 0 ? 0 : 1);
-        for (int i = 0; i < chunk_count; i++) {
+        int chunks = sb.st_size / 4096 + (sb.st_size % 4096 == 0 ? 0 : 1);
+        for (int i = 0; i < chunks; i++) {
             Data* data = malloc(sizeof(Data));
             data->input_data = input_data + (i * 4096);
-            data->input_size = (i < chunk_count - 1) ? 4096 : (sb.st_size - (i * 4096));
+            data->input_size = (i < chunks - 1) ? 4096 : (sb.st_size - (i * 4096));
             enqueue(&tasks, data);
         }
         close(fd);

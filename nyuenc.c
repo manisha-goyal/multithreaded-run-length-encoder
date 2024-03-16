@@ -39,7 +39,10 @@ void init_queue(Queue* queue);
 void enqueue(Queue* queue, Data* data);
 Data* dequeue(Queue* queue);
 void* encode();
-void handleError(const char* message, int exitCode);
+void handle_error(const char* message, int exitCode);
+void create_thread_pool(int num_jobs);
+int create_task_queue(int arg_pos, int argc, char *argv[]);
+void process_completed_tasks(int task_count);
 
 void init_queue(Queue* queue) {
     queue->head = NULL;
@@ -75,6 +78,34 @@ Data* dequeue(Queue* queue) {
     return data;
 }
 
+int main(int argc, char *argv[]) {
+    int opt;
+    int num_jobs = 1;
+
+    while ((opt = getopt(argc, argv, "j:")) != -1) {
+        switch (opt) {
+            case 'j':
+                num_jobs = atoi(optarg);
+                if (num_jobs < 1)
+                    handle_error("Number of jobs must be at least 1", 1);
+                break;
+            default:
+                handle_error("Usage: ./nyuenc [-j njobs] <file1> [file2] ...\n", 1);
+        }
+    }
+
+    if (optind >= argc)
+        handle_error("Usage: ./nyuenc [-j njobs] <file1> [file2] ...\n", 1);
+
+    init_queue(&tasks);
+    init_queue(&completed_tasks);
+
+    create_thread_pool(num_jobs);
+    int task_count = create_task_queue(optind, argc, argv);
+    process_completed_tasks(task_count);
+    return 0;
+}
+
 void* encode() {
     while (1) {
         pthread_mutex_lock(&tasks_mutex);
@@ -103,46 +134,33 @@ void* encode() {
     }
 }
 
-int main(int argc, char* argv[]) {
-    int opt;
-    int num_jobs = 1;
-
-    while ((opt = getopt(argc, argv, "j:")) != -1) {
-        switch (opt) {
-            case 'j':
-                num_jobs = atoi(optarg);
-                if (num_jobs < 1)
-                    handleError("Number of jobs must be at least 1", 1);
-                break;
-            default:
-                handleError("Usage: ./nyuenc [-j njobs] <file1> [file2] ...\n", 1);
-        }
+void create_thread_pool(int num_jobs) {
+    pthread_t threads[num_jobs];
+    for (int i = 0; i < num_jobs; i++) {
+        int thread = pthread_create(&threads[i], NULL, encode, NULL);
+        if(thread)
+            handle_error("Error: unable to create threads", 1);
     }
+}
 
-    if (optind >= argc)
-        handleError("Usage: ./nyuenc [-j njobs] <file1> [file2] ...\n", 1);
-
-    init_queue(&tasks);
-    init_queue(&completed_tasks);
-
-    int arg_pos = optind;
+int create_task_queue(int arg_pos, int argc, char *argv[]) {
     int input_order = 0;
-    int tasks_count = 0;
+    int task_count = 0;
     while (arg_pos < argc) {
         int fd = open(argv[arg_pos++], O_RDONLY);
         if (fd == -1)
-            handleError("Error: unable to open file", 1);
+            handle_error("Error: unable to open file", 1);
 
         struct stat sb;
         if (fstat(fd, &sb) == -1) {
             close(fd);
-            handleError("Error: unable to get file size", 1);
+            handle_error("Error: unable to get file size", 1);
         }
 
         char* input_data = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (input_data == MAP_FAILED) {
             close(fd);
-            handleError("Error: unable to mmap file", 1);
+            handle_error("Error: unable to mmap file", 1);
         }
 
         int chunks = sb.st_size / MAX_CHUNK_SIZE + (sb.st_size % MAX_CHUNK_SIZE == 0 ? 0 : 1);
@@ -156,32 +174,31 @@ int main(int argc, char* argv[]) {
             pthread_cond_signal(&tasks_cond);
             pthread_mutex_unlock(&tasks_mutex);
         }
-        tasks_count += chunks;
+        task_count += chunks;
         close(fd);
     }
 
-    Data* completed_tasks_ordered[tasks_count];
-    for(int i = 0; i < tasks_count; i++)
-        completed_tasks_ordered[i] = NULL;
+    return task_count;
+}
 
-    pthread_t threads[num_jobs];
-    for (int i = 0; i < num_jobs; i++) {
-        int thread = pthread_create(&threads[i], NULL, encode, NULL);
-        if(thread)
-            handleError("Error: unable to create threads", 1);
-    }
-
+void process_completed_tasks(int task_count) {
+    Data* completed_tasks_ordered[task_count];
     char prev_last_char = 0;
     unsigned int prev_last_count = 0;
     int task_index = 0;
-    while(task_index < tasks_count) {
-        if(completed_tasks_ordered[task_index] != NULL) {
-            Data* data = completed_tasks_ordered[task_index];
-            if (prev_last_count > 0 && prev_last_char == data->encoded_data[0]) {
+
+    for(int i = 0; i < task_count; i++)
+        completed_tasks_ordered[i] = NULL;
+
+    while (task_index < task_count) {
+        if (completed_tasks_ordered[task_index] != NULL) {
+            Data *data = completed_tasks_ordered[task_index];
+            if (task_index > 0 && prev_last_char == data->encoded_data[0]) {
                 data->encoded_data[1] += prev_last_count;
                 write(STDOUT_FILENO, data->encoded_data, data->enc_size - 2);
-            } else {
-                if(prev_last_count > 0) {
+            }
+            else {
+                if (prev_last_count > 0) {
                     write(STDOUT_FILENO, &prev_last_char, 1);
                     write(STDOUT_FILENO, &prev_last_count, 1);
                 }
@@ -194,20 +211,18 @@ int main(int argc, char* argv[]) {
         }
 
         pthread_mutex_lock(&completed_tasks_mutex);
-        while(completed_tasks.size == 0)
+        while (completed_tasks.size == 0)
             pthread_cond_wait(&completed_tasks_cond, &completed_tasks_mutex);
-        Data* encoded_chunk = dequeue(&completed_tasks);
+        Data *encoded_chunk = dequeue(&completed_tasks);
         pthread_mutex_unlock(&completed_tasks_mutex);
         completed_tasks_ordered[encoded_chunk->input_order] = encoded_chunk;
     }
 
     write(STDOUT_FILENO, &prev_last_char, 1);
     write(STDOUT_FILENO, &prev_last_count, 1);
-
-    return 0;
 }
 
-void handleError(const char* message, int exitCode) {
+void handle_error(const char* message, int exitCode) {
     fprintf(stderr, "%s\n", message);
     if (exitCode != 0) {
         exit(exitCode);

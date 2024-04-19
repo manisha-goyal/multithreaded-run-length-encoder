@@ -1,0 +1,7 @@
+nyuenc-autograder
+.DS_Store
+nyuenc.o
+nyuenc
+.vscode/settings.json
+Input_Output
+.metals/metals.lock.db
